@@ -1,0 +1,386 @@
+
+#@markdown # Step 1 - Authenticate and Gather Data
+#@markdown ---
+#@markdown 1. <font color=cyan>Import the raw data from tableau report: <a href="https://docs.google.com/spreadsheets/d/1kIUAhSjPSUCUUKHU2toX1x7JwOSn7S72S_jwMXTVAMc/edit#gid=0" target="_blank">here</a> </font>
+#@markdown 2. Run the cell by clicking on the Play button.
+
+!pip install --upgrade gspread
+
+import gspread
+import requests
+import re
+import time
+import os
+import json
+
+import pandas as pd
+import numpy as np 
+
+from itertools import islice
+from google.colab import data_table
+from google.colab import auth
+from google.auth import default
+from IPython.display import clear_output
+from IPython.display import Markdown
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+from google.colab.data_table import DataTable
+from tqdm import tqdm
+
+DataTable.max_columns = 30
+data_table.enable_dataframe_formatter()
+clear_output()
+
+print("✅ Successfully installed all the requried packages.")
+print("+++++++++++++++++++++++++++++++++++++++++")
+print("🚀 Please authorise yourself using your Google Workspace/GMail account.")
+
+auth.authenticate_user()
+creds,_ = default()
+gc = gspread.authorize(creds)
+CONFIG_FILE_KEY = "1rrucEjb425h-tRo_yGETw8p582wl4IKoWps41bVCFtU"
+CONFIG_FILE_PROCESS = "DBA"
+config = dict(gc.open_by_key(CONFIG_FILE_KEY).worksheet(CONFIG_FILE_PROCESS).get_values()[1:])
+config['CATEGORIES'] = json.loads(config['CATEGORIES'])
+config['SUBJECT_GROUP'] = json.loads(config['SUBJECT_GROUP'])
+config['MARKET_QUESTION_URL'] = json.loads(config['MARKET_QUESTION_URL'])
+config['DAILY_GA_COLUMN_NAMES'] = json.loads(config['DAILY_GA_COLUMN_NAMES'])
+config['ALL_PROCESSES'] = json.loads(config['ALL_PROCESSES'])
+config['ANSWER_SOURCE'] = json.loads(config['ANSWER_SOURCE'])
+config['SUPPORTED_LANGUAGES'] = json.loads(config['SUPPORTED_LANGUAGES'])
+config['DATABASE_OLD_PROCESS_RANGES'] = json.loads(config['DATABASE_OLD_PROCESS_RANGES'])
+
+
+clear_output()
+
+print("-"*100)
+print("\033[32m🥳 Authorisation is successful.\x1b[0m")
+print("-"*100)
+
+session_request = requests.Session()
+
+def split_list(lst, size):
+  return [lst[i:i+size] for i in range(0, len(lst), size)]
+
+
+def split_data_into_chunks_for_gsheet(data, available_space):
+  splits = []
+  splits.append(np.array(data[:available_space]))
+  remaining_space = len(data) - available_space
+  remaining_split_size = np.ceil((remaining_space)/(4_000_000-1))
+  if len(data) > available_space:
+    splits.extend(np.array_split(data[available_space:],remaining_split_size))
+  return splits
+
+def create_datasheet_and_upload(gc_ref, folder_id):
+  time_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+  last_database_entry = gc_ref.create(f'''dba_nodes_database_table ({time_now})''', folder_id = folder_id)
+  last_database_entry_worksheet = last_database_entry.add_worksheet("data", rows=2, cols=2)
+  last_database_entry_worksheet.batch_update([{
+      'range' : 'A1:E1',
+      'values' : [['question_id', 'route', 'market', 'uploaded_on', 'uploaded_into']]
+  }])
+  last_database_entry.del_worksheet(last_database_entry.worksheet("Sheet1"))
+  return last_database_entry
+
+def update_database(gc, config, question_ids_to_upload, uploaded_into_sheet_url):
+  UPLOADED_DATE = datetime.today().strftime("%Y-%m-%d %H:%M:%S")
+  DATABASE_INDEXER_SHEET_ID = config['DATABASE_INDEXER_SHEET_ID']
+  UPLOADED_QUESTIONS_DATABASE_FOLDER_ID = config['DATABASE_NODES_FOLDER_ID']
+  route = config['DATABASE_PROCESS']
+  market = config['MARKET']
+
+  print(f"⌛ Connecting to the Nodes Database. Please wait...")
+
+  if not question_ids_to_upload:
+    raise Exception("No question ids found! Please recheck the sheet and try again!")
+
+  question_ids_to_upload_df = pd.DataFrame()
+  question_ids_to_upload_df['question_id'] = pd.Series(question_ids_to_upload)
+  question_ids_to_upload_df['route'] = route
+  question_ids_to_upload_df['market'] = market
+  question_ids_to_upload_df["uploaded_on"] = UPLOADED_DATE
+  question_ids_to_upload_df["uploaded_into"] = uploaded_into_sheet_url
+  database_indexer = gc.open_by_key(DATABASE_INDEXER_SHEET_ID)
+  database_indexer_root_sheet = database_indexer.worksheet(config['DATABASE_PROCESS'])
+  database_index_raw = database_indexer_root_sheet.get_all_values()
+  database_indexer_root_sheet_rows = len(database_index_raw)
+
+  print(f"✅ Successfully connected to the database.")
+  stars = "*" * 10
+  print(stars + " SUMMARY " + stars)
+  print(f"Number of Nodes: {question_ids_to_upload_df['question_id'].size}")
+  print(stars + " SUMMARY " + stars)
+
+  print(f"📁 Nodes are being uploaded to the database. ⌛ Please wait...")
+
+
+  last_database_entry_worksheet = None
+  last_indexed_sheet = None
+  if len(database_index_raw) <= 1:
+    time_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    last_database_sheet = create_datasheet_and_upload(gc, UPLOADED_QUESTIONS_DATABASE_FOLDER_ID)
+    database_indexer_root_sheet.batch_update([{
+        'range' : f'A{database_indexer_root_sheet_rows + 1}:C{database_indexer_root_sheet_rows + 1}',
+        'values' : [[last_database_sheet.url, time_now]]
+    }])
+
+    last_indexed_sheet = last_database_sheet
+
+
+  last_database_entry_spreadsheet = last_indexed_sheet if last_indexed_sheet else gc.open_by_url(database_index_raw[-1][0])
+  last_database_entry_worksheet = last_database_entry_spreadsheet.worksheet("data")
+  last_database_entry_worksheet_raw_values = last_database_entry_worksheet.get_all_values()
+
+  remaining_entries_open_to_fill = 4_000_000//len(last_database_entry_worksheet_raw_values[0]) - len(last_database_entry_worksheet_raw_values)
+
+  chunks = split_data_into_chunks_for_gsheet(question_ids_to_upload_df.values.tolist(), remaining_entries_open_to_fill)
+  last_database_entry_worksheet.append_rows(chunks[0].tolist())
+  for chunk in chunks[1:]:
+    time_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    database_index_raw = database_indexer_root_sheet.get_all_values()
+    database_indexer_root_sheet_rows = len(database_index_raw)
+    last_database_sheet = create_datasheet_and_upload(gc, UPLOADED_QUESTIONS_DATABASE_FOLDER_ID)
+    database_indexer_root_sheet.batch_update([{
+        'range' : f'A{database_indexer_root_sheet_rows + 1}:C{database_indexer_root_sheet_rows + 1}',
+        'values' : [[last_database_sheet.url, time_now]]
+    }])
+    last_database_sheet.worksheet("data").append_rows(chunk.tolist())
+
+
+  print(f"✅ Successfully uploaded {len(question_ids_to_upload)} nodes into the database.")
+
+def database_check(gc, config, question_ids_to_check):
+  response_df = pd.DataFrame(pd.Series(question_ids_to_check), columns=["question_id"])
+  routes = config['ALL_PROCESSES']
+
+  DATABASE_INDEXER_SHEET_ID = config['DATABASE_INDEXER_SHEET_ID']
+  print(f"⌛ Connecting to the nodes Database. Please wait...")
+  database_indexer = gc.open_by_key(DATABASE_INDEXER_SHEET_ID)
+  print(f"✅ Successfully connected to the database.")
+  print(f"🚧 Running the database query to fetch the results. Please wait...")
+  for index, process in routes.items():
+    database_indexer_root_sheet = database_indexer.worksheet(process)
+    database_index_raw = database_indexer_root_sheet.get_all_values()
+    print(f"\r🚧 Running the database query to fetch the results from the process named: {process}. Please wait...", end="")
+    database_indexer_root_sheet_rows = pd.DataFrame.from_records(data=database_index_raw[1:], columns=database_index_raw[0])
+    database_indexer_root_sheet_rows = database_indexer_root_sheet_rows[database_indexer_root_sheet_rows['Sheet Link'] != ""]
+    last_database_entry_worksheet = None
+    last_indexed_sheet = None
+    database = []
+    for endpoint in database_indexer_root_sheet_rows['Sheet Link']:
+      ss = gc.open_by_url(endpoint)
+      ws = ss.worksheet("data")
+      raw_data = ws.get_all_values()
+      df = pd.DataFrame.from_records(data=raw_data[1:], columns=raw_data[0])
+      database.append(df)
+    database_df = pd.concat(database) if len(database) > 0 else pd.DataFrame(columns=['question_id'])
+    if len(database_index_raw) > 1:
+      database_df.drop_duplicates(subset=['question_id'], keep='last', inplace=True)
+    response_df[process] = response_df['question_id'].isin(database_df['question_id']).astype(bool)
+    print(f"\r✅ Successfully processed the database query.", end="")
+  
+  response_df['Exist Status'] = response_df[config['ALL_PROCESSES'].values()].sum(axis=1).astype(bool)
+  return response_df
+
+def old_database_check(gc, config, question_ids_to_check, new_database_df):
+  print(f"\n⌛ Connecting and fetching results from the old database as well. Please wait...")
+  new_db_df = new_database_df.copy()
+  old_database_ws = gc.open_by_key(config['DATABASE_OLD_SHEET_ID']).worksheet(config['DATABASE_OLD_SHEET_NAME'])
+  old_database_processes = config['DATABASE_OLD_PROCESS_RANGES']
+  old_database_processes_keys = list(config['DATABASE_OLD_PROCESS_RANGES'].keys())
+  resultant_range = []
+  for item, value in old_database_processes.items():
+    resultant_range.append(value)
+
+  database_raw_data = old_database_ws.batch_get(resultant_range)
+  database_raw_dict = {}
+  for index, key in enumerate(old_database_processes_keys):
+    internal_process_question_ids = [row[0] for row in database_raw_data[index] if row[0] != ""]
+    new_db_df[key] = new_db_df[key].astype(bool) + new_db_df['question_id'].isin(internal_process_question_ids)
+
+  new_db_df['Exist Status'] = new_db_df[config['ALL_PROCESSES'].values()].sum(axis=1).astype(bool)
+  print("")
+  print("-"*100)
+  print("\033[32m📖 Summary: Duplication Found\x1b[0m")
+  print("-"*100)
+  display(new_db_df[list(config['ALL_PROCESSES'].values())].sum())
+  print("-"*100)
+  return new_db_df
+
+
+
+def get_ga_df_id_create_session_details(gc, config):
+  print(f"⌛ Google Analytics report is being loaded... Please wait...")
+  ga_ss = gc.open_by_url(config['DAILY_GA_REPORT'])
+  ga_sheet = ga_ss.worksheet(config['DAILY_GA_TAB_NAME'])
+  ga_data = ga_sheet.get_values(config['DAILY_GA_QID_CREAT_SESS_RANGE'])[:int(config['MAX_SELECTED_GA_SAMPLE_SIZE'])]
+  ga_data_df = pd.DataFrame.from_records(ga_data, columns=config['DAILY_GA_COLUMN_NAMES'])
+  ga_data_df['session_count'] = ga_data_df['session_count'].astype(int)
+  ga_data_df['campaign'] = ga_data_df['campaign'].astype(str)
+  duplicated_data = ga_data_df[ga_data_df.duplicated(subset=['question_id'], keep='first')]
+  print("✅ Report has been loaded successfully.")
+  print("-"*100)
+  print(f"Google Analytics duplicates removed (Count): \033[93m{len(duplicated_data)}\x1b[0m")
+  ga_data_df.drop_duplicates(subset=['question_id'], keep='first', inplace=True)
+  print(f"Remaining Google Analytics question IDs (Count): \033[93m{len(ga_data_df)}\x1b[0m")
+  print("-"*100)
+
+  if len(ga_data_df) == 0:
+    raise Exception("No questions found! Please recheck the GA report filters, rerun the report and try again!")
+
+  ga_data_df['question_param_placeholder'] = "id[]=" + ga_data_df['question_id']
+  ga_data_df['question_id_param_placeholder'] = "i" + ga_data_df['question_id'].astype(str)
+  ga_data_df['graph_ql_query'] = ga_data_df['question_id_param_placeholder'] + ":questionById(id:$" + ga_data_df['question_id_param_placeholder'] + "){content,databaseId,created,subject{name},answers{nodes{author{category,nick},content,databaseId,created}}}"
+  ga_data_df['graph_ql_query_parameters'] = "$"+ga_data_df['question_id_param_placeholder']+":Int!"
+  print("✅ Successfully fetched the question ids and session details.")
+  return ga_data_df
+
+def fetcher(param_list, endpoint):
+  param = "&".join(param_list)
+  res = session_request.get(endpoint.format(param=param))
+  res_data = res.json().get('data', None)
+  if res_data:
+    return res_data
+
+from functools import reduce
+import operator
+
+def fetch_data_from_endpoint(endpoint, param_lists, fetch_type):
+  response_data = []
+  with ThreadPoolExecutor() as pool:
+    response_data_raw = list(tqdm(pool.map(fetcher, [param_list for param_list in param_lists], [endpoint]*len(param_lists)), total=len(param_lists)))
+    response_data.extend([data for data in response_data_raw if data != None])
+    pool.shutdown(wait=True)
+  if len(response_data) == 0:
+    raise Exception("No questions found! Please recheck, rerun the GA sheet and try again!")
+  return reduce(operator.concat, response_data)
+
+
+
+
+
+def fetch_data_df_from_endpoint_through_ga_records(config, ga_data_df):
+  question_param_lists = split_list(list(ga_data_df['question_param_placeholder']), 100)
+  print("⌛ Downloading the question metadata (content text, response count, attachment count, etc.)... Please wait...")
+  question_data = fetch_data_from_endpoint(config['API_Q_ENDPOINT'], question_param_lists, "question")
+  resultant_data = pd.json_normalize(question_data)
+  resultant_data.rename(columns={'id' : 'question_id'}, inplace=True)
+  resultant_data.rename(columns={"user_id" : "questioner_id", "content" : "question_content", "created": "question_created", "responses" : "question_response_count"}, inplace=True)
+  resultant_data = resultant_data[['question_id', 'subject_id', 'questioner_id', 'question_content', 'question_created', 'question_response_count']].copy()
+  resultant_data['question_url'] = config['QUESTION_URL'] + resultant_data['question_id'].astype(str)
+  resultant_data.fillna("", inplace=True)
+  resultant_data.drop_duplicates(inplace=True)
+  resultant_data['question_id'] = resultant_data['question_id'].astype(str)
+  print("✅ Successfully downloaded questions' metadata.\n")
+  return resultant_data
+
+
+def detect_language(gc, config, q_content_df):
+  print("⌛ Detecting the language of question content using Google Language Detection API... Please wait...")
+  language_detection_spreadsheet = gc.open_by_url(config['GOOGLE_TRANSLATE_SHEET_URL'])
+  language_detection_sheet = language_detection_spreadsheet.worksheet(config['GOOGLE_TRANSLATE_HOME'])
+
+  language_detection_spreadsheet.values_clear("A2:C")
+  question_content_df = q_content_df[['question_id', 'question_content']].copy().reset_index(drop=True)
+  question_content_df['question_content'] = question_content_df['question_content'].map(lambda x: re.sub(r'^', '\'', x))
+  question_content_df['detect'] = "=DETECTLANGUAGE(B" + pd.Series(map(lambda x: str(x), range(2, len(question_content_df) + 2))) + ")"
+
+  language_detection_spreadsheet.values_update("Root!A2:C", params={'valueInputOption': 'USER_ENTERED'}, body={'values': question_content_df.values.tolist()})
+
+  while language_detection_sheet.get_values("D1")[0][0] != "0":
+    time.sleep(3)
+
+
+
+  resultant_records = pd.DataFrame(language_detection_sheet.get_values('A1:C'))
+  language_detection_spreadsheet.values_clear("A2:C")
+  resultant_records.columns = ["question_id", "question_content", "language"]
+  resultant_records.drop(index=resultant_records.index[0],  axis=0, inplace=True)
+  resultant_records.reset_index(drop=True, inplace=True)
+  print("✅ Successfully detected the language of question content.")
+  return resultant_records
+
+  
+  
+ga_data = get_ga_df_id_create_session_details(gc, config)
+database_result = database_check(gc, config, ga_data['question_id'].tolist())
+ga_database_result = ga_data.merge(database_result, how="left", on="question_id")
+ga_database_result.sort_values(by=['session_count'], inplace=True, ascending=False)
+ga_database_update_result = old_database_check(gc, config, ga_database_result['question_id'], ga_database_result)
+question_response_data = fetch_data_df_from_endpoint_through_ga_records(config, ga_database_update_result[ga_database_update_result['Exist Status'] == False])
+print("-"*100)
+print("\033[32m📖 Summary: Question Response Count\x1b[0m")
+print("-"*100)
+zero_response_df = question_response_data.query("question_response_count == 0")
+one_response_df = question_response_data.query("question_response_count == 1")
+two_responses_df = question_response_data.query("question_response_count == 2")
+
+print(f"\033[1m\033[36mNumber of questions with 0 response: {len(zero_response_df['question_id'].drop_duplicates())}\x1b[0m\x1b[0m")
+print(f"Number of questions with 1 response: {len(one_response_df['question_id'].drop_duplicates())}")
+print(f"Number of questions with 2 responses: {len(two_responses_df['question_id'].drop_duplicates())}")
+print("-"*100)
+
+question_response_data_new = question_response_data.query("question_response_count == 0").copy()
+question_response_data_new['question_id'] = question_response_data_new['question_id'].astype(str)
+question_response_data_new = question_response_data_new.merge(ga_data[['question_id', 'session_count','campaign']], on='question_id', how='left')
+question_response_data_new.sort_values('session_count',ascending=False, inplace=True)
+
+question_response_data_new['week'] = datetime.now().isocalendar()[1]
+question_response_data_new['created_text'] = datetime.today().strftime("%d-%b")
+question_response_data_new['expiration_date'] = pd.to_datetime(question_response_data_new['question_created']) + pd.Timedelta(7, unit='D')
+BRAINLY_SUBJECT_MAPPING = config['SUBJECT_GROUP']
+
+question_response_data_new['brainly_subject'] = question_response_data_new['subject_id'].astype(str).apply(lambda x: BRAINLY_SUBJECT_MAPPING.get(x, x))
+question_response_data_new['question_content'] = question_response_data_new['question_content'].replace(r'\n', '', regex = True)
+question_response_data_new['question_content'] = question_response_data_new['question_content'].replace(r'<[^<]+?>', '', regex = True)
+question_response_data_new['question_content'] = "'" + question_response_data_new['question_content']
+question_response_data_new = question_response_data_new[['week', 'created_text', 'expiration_date', 'session_count', 'brainly_subject', 'question_id', 'question_content', 'question_url','campaign']].copy()
+question_response_data_new['expiration_date'] = pd.to_datetime(question_response_data_new['expiration_date'], format="%Y-%m-%d %H:%M:%S.%f", utc=True).dt.tz_convert('Poland').dt.strftime("%Y-%m-%d %H:%M:%S.%f")
+
+question_response_data_new = question_response_data_new[question_response_data_new['brainly_subject'].isin([*config['SUBJECT_GROUP'].values()])].copy()
+question_response_data_new.drop_duplicates(inplace=True)
+
+# language_details = detect_language(gc, config, question_response_data_new)
+# question_response_data_new = question_response_data_new.merge(language_details[['question_id', 'language']], how="left", on="question_id")
+
+# if len(config['SUPPORTED_LANGUAGES'].keys()):
+#   query_language_filter_array = []
+#   for key in list(config['SUPPORTED_LANGUAGES'].keys()):
+#     if len(config['SUPPORTED_LANGUAGES'][key]) == 0:
+#       query_language_filter_array.append(f"language == '{key}'")
+#     else:
+#       query_language_filter_array.append("(" + " | ".join([f"(language == '{key}' & brainly_subject == '{sub}')" for sub in config['SUPPORTED_LANGUAGES'][key]]) + ")")
+    
+#   query_string = " | ".join(query_language_filter_array)
+#   question_response_data_new = question_response_data_new.query(query_string)
+
+print(f"\033[1m\033[36mNumber of questions available to allocate after filtering out not-required subjects: {len(question_response_data_new['question_id'].drop_duplicates())}\x1b[0m\x1b[0m")
+
+
+print("⌛ Generating the intermediate preview file. Please wait...")
+template_spreadsheet = gc.copy(config['INTERMEDIATE_PREVIEW_FILE_ID'], f"{str(datetime.today())} - {config['INTERMEDIATE_PREVIEW_FILE_TITLE']}", copy_comments=False)
+
+SUBJECT_GROUPS_FOR_ANSWERING = config['CATEGORIES']
+
+template_preview_sample_sheet = template_spreadsheet.worksheet(config['INTERMEDIATE_PREVIEW_FILE_SHEET_NAME'])
+template_preview_sample_sheet.update(f"A7:I", question_response_data_new[['week', 'created_text', 'expiration_date', 'session_count', 'brainly_subject', 'question_id', 'question_content', 'question_url',"campaign"]].values.tolist(), value_input_option="USER_ENTERED")
+
+body = {
+    "requests": [
+        {
+            'repeatCell': {
+                'range': {
+                    'sheetId': template_preview_sample_sheet.id,
+                    'startRowIndex': 6,
+                    'startColumnIndex': 1,
+                    'endColumnIndex': 3
+                },
+                'cell': {'userEnteredFormat': {'numberFormat': {'type': "DATE", 'pattern': "dd/mm/yyyy HH:MM:SS"}}},
+                'fields': 'userEnteredFormat.numberFormat'
+            }
+        }
+    ]
+}
+template_spreadsheet.batch_update(body)
+print(f"\033[32m✅ Successfully generated the intermediate preview file, which can be previewed here: \x1b[0m{template_spreadsheet.url}")
