@@ -1,0 +1,217 @@
+if not len(question_response_data_new):
+  raise Exception("Stop! There are 0 questions with no responses; hence, the work cannot be delegated.")
+
+#@markdown ##👽 Step 2 - Update DBA Monthly Workbook and the Central Database
+#@markdown ---
+
+#@markdown 1. <font color=cyan>Enter the ***Google Sheet URL*** of the workbook below.</font>
+URL = "https://docs.google.com/spreadsheets/d/1ndtMm3pDP8MoMOEMAz6nxoO5CcvyV8uP5TUgazGwRrY/edit#gid=826437000" #@param {type:"string"}
+#@markdown 2. <font color=cyan>Specify the final sample size you want to push.</font> [For example: 400, 500, 600, etc.]
+FINAL_SAMPLE_SIZE =   1500#@param {type:"integer"}
+
+if FINAL_SAMPLE_SIZE < 1 or FINAL_SAMPLE_SIZE == None:
+  raise Exception("Whoops! You specified the invalid sample size. Please recheck and try again!")
+
+#@markdown 3. Run the cell by clicking on the Play button, so as to update the workbook.
+
+resultant_dataframe_to_push = question_response_data_new.head(FINAL_SAMPLE_SIZE).copy()
+
+
+print("⌛ Pushing samples for all subject categories in the DBA workbook... Please wait...")
+vendor_spreadsheet = gc.open_by_url(URL)
+collective_count = 0
+header_rows = 7
+question_ids = []
+for category, subjects in config['CATEGORIES'].items():
+  requests = []
+  sheet = vendor_spreadsheet.worksheet(category)
+  sheet.clear_basic_filter()
+  res = sheet.get_values("H8:H")
+  last_row = len(res) + header_rows + 1
+  subject_details_to_push = resultant_dataframe_to_push[resultant_dataframe_to_push['brainly_subject'].isin(subjects)]
+  question_ids_to_append = pd.DataFrame(subject_details_to_push['question_id']).copy()
+  question_ids_to_append['status'] = "EXISTS"
+  question_ids.extend(question_ids_to_append.values.tolist())
+  to_push = subject_details_to_push[['week', 'created_text', 'expiration_date', 'session_count', 'brainly_subject', 'question_id', 'question_content', 'question_url','campaign']].values.tolist()
+  if len(to_push) == 0:
+    print(f"{category} Sample Count Pushed: {len(to_push)}")
+    continue
+  sheet.add_rows(1)
+  sheet.update(f"A{last_row}:I", to_push, value_input_option="USER_ENTERED")
+  print(f"{category} Sample Count Pushed: {len(to_push)}")
+  datetime_formatting =  {
+      "repeatCell": {
+        "range": {
+          "sheetId": sheet.id,
+          "startRowIndex": 13,
+          "startColumnIndex": 6,
+          "endColumnIndex": 7
+        },
+        "cell": {
+          "userEnteredFormat": {
+            "numberFormat": {
+              "type": "DATE",
+              "pattern": "m/d/yyyy"
+            }
+          }
+        },
+        "fields": "userEnteredFormat.numberFormat"
+      }
+    }
+  
+  right_border = {
+      "updateBorders": {
+        "range": {
+          "sheetId": sheet.id,
+          "startRowIndex": 12,
+          "startColumnIndex": 12,
+          "endColumnIndex": 13
+        },
+        "right": {
+          "style": "SOLID_MEDIUM",
+          "width": 1,
+          "color": {
+              "red": 0.8,
+              "green": 0.0,
+            "blue": 0.0,
+            "alpha" : 1.0
+          },
+        }
+      }
+  }
+
+  filter_request = {
+      "setBasicFilter" : {
+          "filter": {
+            "range": {
+                "sheetId": sheet.id,
+                 "startRowIndex": 12,
+                 "startColumnIndex": 1,
+                  "endColumnIndex": 16
+              },
+            "sortSpecs": [
+                          {
+              "backgroundColor": {
+                "red": 1.0,
+                "green": 1.0,
+                "blue": 1.0,
+                "alpha": 1.0
+            },
+            "dimensionIndex": 9
+          },
+              {
+                "sortOrder": "ASCENDING",
+               "dimensionIndex": 6
+              }
+              
+            ],
+            # "criteria": {
+            #   integer: {
+            #     object (FilterCriteria)
+            #   },
+            #   ...
+            # },
+            "filterSpecs": [
+              # {
+              #   "filterCriteria": {
+              #     "visibleBackgroundColor": {
+              #         "red": 1.0,
+              #         "blue": 1.0,
+              #         "green": 1.0,
+              #         "alpha": 1.0
+              #     }
+              #   },
+
+              #   "columnIndex": 8,
+              # },
+              {
+                "filterCriteria": {
+                  "condition": {
+                      "type": "BLANK",
+                  }
+                },
+
+                "columnIndex": 12,
+              },
+              {
+                "filterCriteria": {
+                  "hiddenValues": ["1Approval","Approved", "Expired"]
+                },
+
+                "columnIndex": 13,
+              }
+            ]
+          }
+      }
+  }
+
+  # sort_range_colour_request = {
+  #     "sortRange" : {
+  #         "range" : {
+  #             "sheetId": sheet.id,
+  #                "startRowIndex": 13,
+  #                "startColumnIndex": 1,
+  #                 "endColumnIndex": 14
+              
+  #         },
+  #         "sortSpecs" : [ {
+  #             "backgroundColor": {
+  #               "red": 1.0,
+  #               "green": 1.0,
+  #               "blue": 1.0,
+  #               "alpha": 1.0
+  #           },
+  #           "dimensionIndex": 8
+  #         }
+  #         ]
+  #     }
+  # }
+  requests.extend([datetime_formatting, right_border, filter_request])
+  body = {
+    "requests": [
+        {
+            'repeatCell': {
+                'range': {
+                    'sheetId': sheet.id,
+                    'startRowIndex': 7,
+                    'startColumnIndex': 1,
+                    'endColumnIndex': 3
+                },
+                'cell': {'userEnteredFormat': {'numberFormat': {'type': "DATE", 'pattern': "dd/mm/yyyy HH:MM:SS"}}},
+                'fields': 'userEnteredFormat.numberFormat'
+            }
+        }
+    ]
+}
+  vendor_spreadsheet.batch_update(body)
+  # vendor_spreadsheet.batch_update({"requests": requests})
+  collective_count += len(to_push)
+
+print(f"✅ Total number of samples pushed: {collective_count}")
+print(f"👀 The sample is pushed here: {URL}")
+
+
+
+print("⌛ Updating the old database... Please wait...")
+
+DATEBASE_TAB_NAME = config['DATABASE_OLD_SHEET_NAME']
+
+read_database = gc.open_by_key(config['DATABASE_OLD_SHEET_ID'])
+database_tab = read_database.worksheet(DATEBASE_TAB_NAME)
+res = database_tab.get_values(config['DATABASE_OLD_PROCESS_RANGES']['DBA'])
+database_tab.add_rows(1)
+last_row = len(res) + 1 + 1 + 1
+read_database.values_update(f"{DATEBASE_TAB_NAME}!Y{last_row}", params={
+        'valueInputOption': 'USER_ENTERED'
+    },
+    body={
+        'values': question_ids
+    });
+print("✅ Successfully updated the old database for DBA.")
+
+print("⌛ Updating the new database... Please wait...")
+update_database(gc, config, [id[0] for id in question_ids], URL)
+print("✅ Successfully updated the new database for DBA.")
+
+print("\n\n🌻 It's done! Have a great day!")
+
